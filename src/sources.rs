@@ -182,6 +182,10 @@ pub fn cfio_watts(item: CFDictionaryRef, unit: &String, duration: u64) -> WithEr
   }
 }
 
+pub fn cfio_bytes(item: CFDictionaryRef) -> u64 {
+  unsafe { IOReportSimpleGetIntegerValue(item, 0) as u64 }
+}
+
 // MARK: IOServiceIterator
 
 pub struct IOServiceIterator {

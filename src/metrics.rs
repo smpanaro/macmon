@@ -1,7 +1,8 @@
 use core_foundation::dictionary::CFDictionaryRef;
 
 use crate::sources::{
-  cfio_get_residencies, cfio_watts, libc_ram, libc_swap, IOHIDSensors, IOReport, SocInfo, SMC,
+  cfio_bytes, cfio_get_residencies, cfio_watts, libc_ram, libc_swap, IOHIDSensors, IOReport,
+  SocInfo, SMC,
 };
 
 type WithError<T> = Result<T, Box<dyn std::error::Error>>;
@@ -38,6 +39,10 @@ pub struct Metrics {
   pub ane_power: f32,         // Watts
   pub all_power: f32,         // Watts
   pub sys_power: f32,         // Watts
+  pub ane_rd_bw: u64,         // ANE read bandwidth in B/s
+  pub ane_wr_bw: u64,         // ANE write bandwidth in B/s
+  pub sys_rd_bw: u64,         // system read bandwidth in B/s (excluding ANE)
+  pub sys_wr_bw: u64,         // system write bandwidth in B/s (excluding ANE)
 }
 
 // MARK: Helpers
@@ -135,6 +140,7 @@ impl Sampler {
       // ("CPU Stats", Some(CPU_FREQ_DICE_SUBG)), // cpu freq by cluster
       ("CPU Stats", Some(CPU_FREQ_CORE_SUBG)), // cpu freq per core
       ("GPU Stats", Some(GPU_FREQ_DICE_SUBG)), // gpu freq
+      ("AMC Stats", Some("Perf Counters")),    // mem bw
     ];
 
     let soc = SocInfo::new()?;
@@ -252,10 +258,45 @@ impl Sampler {
             _ => {}
           }
         }
+
+        if x.group == "AMC Stats" && x.subgroup == "Perf Counters" {
+          match x.channel.as_str() {
+            // There are two values for ANE: "ANE0 DCS RD" and "ANE0 RD".
+            // Per asitop, DCS = DRAM Command Scheduler. When asitop
+            // supported bandwidth, it used the DCS values (for CPU).
+            // The DCS value also seems closer to the number I expect for a test
+            // ANE model based on the size of the weights and the tokens/second.
+            // The non-DCS value is slightly higher.
+            s if s.starts_with("ANE") && s.ends_with("DCS RD") => {
+              rs.ane_rd_bw += cfio_bytes(x.item); // bytes
+            }
+            s if s.starts_with("ANE") && s.ends_with("DCS WR") => {
+              rs.ane_wr_bw += cfio_bytes(x.item); // bytes
+            }
+            // There doesn't seem to be a non-DCS overall metric.
+            // NOTE: This includes the ANE value, which is subtracted out below.
+            "DCS RD" => {
+              rs.sys_rd_bw += cfio_bytes(x.item); // bytes
+            }
+            "DCS WR" => {
+              rs.sys_wr_bw += cfio_bytes(x.item); // bytes
+            }
+            _ => {}
+          }
+        }
       }
 
       rs.ecpu_usage = calc_freq_final(&ecpu_usages, &self.soc.ecpu_freqs);
       rs.pcpu_usage = calc_freq_final(&pcpu_usages, &self.soc.pcpu_freqs);
+      rs.sys_rd_bw =
+        zero_div(rs.sys_rd_bw.saturating_sub(rs.ane_rd_bw) as f64, sample_dt as f64 / 1000.0)
+          as u64; // bytes/sec
+      rs.sys_wr_bw =
+        zero_div(rs.sys_wr_bw.saturating_sub(rs.ane_wr_bw) as f64, sample_dt as f64 / 1000.0)
+          as u64; // bytes/sec
+      rs.ane_rd_bw = zero_div(rs.ane_rd_bw as f64, sample_dt as f64 / 1000.0) as u64; // bytes/sec
+      rs.ane_wr_bw = zero_div(rs.ane_wr_bw as f64, sample_dt as f64 / 1000.0) as u64; // bytes/sec
+
       results.push(rs);
     }
 
@@ -270,6 +311,11 @@ impl Sampler {
     rs.gpu_power = zero_div(results.iter().map(|x| x.gpu_power).sum(), measures as _);
     rs.ane_power = zero_div(results.iter().map(|x| x.ane_power).sum(), measures as _);
     rs.all_power = rs.cpu_power + rs.gpu_power + rs.ane_power;
+
+    rs.sys_rd_bw = zero_div(results.iter().map(|x| x.sys_rd_bw).sum(), measures as _); // bytes/sec
+    rs.sys_wr_bw = zero_div(results.iter().map(|x| x.sys_wr_bw).sum(), measures as _); // bytes/sec
+    rs.ane_rd_bw = zero_div(results.iter().map(|x| x.ane_rd_bw).sum(), measures as _); // bytes/sec
+    rs.ane_wr_bw = zero_div(results.iter().map(|x| x.ane_wr_bw).sum(), measures as _); // bytes/sec
 
     rs.memory = self.get_mem()?;
     rs.temp = self.get_temp()?;

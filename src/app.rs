@@ -103,11 +103,37 @@ impl MemoryStore {
   }
 }
 
+#[derive(Debug, Default)]
+struct BandwidthStore {
+  items: Vec<u64>,
+  current: f64,
+  max: f64,
+  avg: f64,
+}
+
+impl BandwidthStore {
+  fn push(&mut self, value: u64) {
+    items_add(&mut self.items, value);
+    self.current = value as f64;
+    self.max = self.max.max(value as f64);
+    self.avg = (self.items.iter().sum::<u64>() as f64 / self.items.len() as f64).round();
+  }
+}
+
 // MARK: Components
 
 fn h_stack(area: Rect) -> (Rect, Rect) {
   let ha = Layout::default()
     .direction(Direction::Horizontal)
+    .constraints([Constraint::Fill(1), Constraint::Fill(1)].as_ref())
+    .split(area);
+
+  (ha[0], ha[1])
+}
+
+fn v_stack(area: Rect) -> (Rect, Rect) {
+  let ha = Layout::default()
+    .direction(Direction::Vertical)
     .constraints([Constraint::Fill(1), Constraint::Fill(1)].as_ref())
     .split(area);
 
@@ -190,6 +216,16 @@ pub struct App {
   ecpu_freq: FreqStore,
   pcpu_freq: FreqStore,
   igpu_freq: FreqStore,
+
+  ane_rd_bw: BandwidthStore,
+  ane_wr_bw: BandwidthStore,
+  ane_total_bw: BandwidthStore,
+  sys_rd_bw: BandwidthStore,
+  sys_wr_bw: BandwidthStore,
+  sys_total_bw: BandwidthStore,
+  all_rd_bw: BandwidthStore,
+  all_wr_bw: BandwidthStore,
+  all_total_bw: BandwidthStore,
 }
 
 impl App {
@@ -210,6 +246,15 @@ impl App {
     self.igpu_freq.push(data.gpu_usage.0 as u64, data.gpu_usage.1 as f64);
     self.temp = data.temp;
     self.mem.push(data.memory);
+    self.ane_rd_bw.push(data.ane_rd_bw);
+    self.ane_wr_bw.push(data.ane_wr_bw);
+    self.ane_total_bw.push(data.ane_rd_bw + data.ane_wr_bw);
+    self.sys_rd_bw.push(data.sys_rd_bw);
+    self.sys_wr_bw.push(data.sys_wr_bw);
+    self.sys_total_bw.push(data.sys_rd_bw + data.sys_wr_bw);
+    self.all_rd_bw.push(data.ane_rd_bw + data.sys_rd_bw);
+    self.all_wr_bw.push(data.ane_wr_bw + data.sys_wr_bw);
+    self.all_total_bw.push(data.ane_rd_bw + data.ane_wr_bw + data.sys_rd_bw + data.sys_wr_bw);
   }
 
   fn title_block<'a>(&self, label_l: &str, label_r: &str) -> Block<'a> {
@@ -218,6 +263,25 @@ impl App {
       .border_type(BorderType::Rounded)
       .border_style(self.cfg.color)
       // .title_style(Style::default().gray())
+      .padding(Padding::ZERO);
+
+    if label_l.len() > 0 {
+      block = block.title_top(Line::from(format!(" {label_l} ")));
+    }
+
+    if label_r.len() > 0 {
+      block = block.title_top(Line::from(format!(" {label_r} ")).alignment(Alignment::Right));
+    }
+
+    block
+  }
+
+  fn borderless_title<'a>(&self, label_l: &str, label_r: &str) -> Block<'a> {
+    let mut block = Block::new()
+      .borders(Borders::TOP)
+      .border_type(BorderType::Double)
+      .title_style(self.cfg.color)
+      .border_style(self.cfg.color)
       .padding(Padding::ZERO);
 
     if label_l.len() > 0 {
@@ -248,6 +312,23 @@ impl App {
       .block(self.title_block(label_l.as_str(), label_r.as_str()))
       .direction(RenderDirection::RightToLeft)
       .data(&val.items)
+      .style(self.cfg.color)
+  }
+
+  fn get_bandwidth_block<'a>(&self, label: &str, val: &'a BandwidthStore) -> Sparkline<'a> {
+    let label = format!(
+      "{} {:.2} GB/s ({:.2}, {:.2})",
+      label,
+      val.current / 1e9,
+      val.avg / 1e9,
+      val.max / 1e9
+    );
+
+    Sparkline::default()
+      .block(self.title_block(&label, ""))
+      .direction(RenderDirection::RightToLeft)
+      .data(val.items.iter().map(|&x| x as u64).collect::<Vec<u64>>())
+      .max(val.max as u64)
       .style(self.cfg.color)
   }
 
@@ -322,7 +403,7 @@ impl App {
 
     let rows = Layout::default()
       .direction(Direction::Vertical)
-      .constraints([Constraint::Fill(2), Constraint::Fill(1)].as_ref())
+      .constraints([Constraint::Fill(3), Constraint::Fill(2), Constraint::Fill(2)].as_ref())
       .split(f.area());
 
     let brand = format!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -345,7 +426,51 @@ impl App {
     self.render_mem_block(f, c1, &self.mem);
     self.render_freq_block(f, c2, "GPU", &self.igpu_freq);
 
-    // 3rd row
+    // Bandwidth row
+    let bw_label = format!(
+      "Bandwidth: {:.2} GB/s (avg. {:.2} GB/s, max. {:.2} GB/s)",
+      self.all_total_bw.current / 1e9,
+      self.all_total_bw.avg / 1e9,
+      self.all_total_bw.max / 1e9
+    );
+    let bw_block = self.title_block(&bw_label, "");
+    let bw_area = bw_block.inner(rows[1]);
+    f.render_widget(bw_block, rows[1]);
+
+    let bw_area = Layout::default()
+      .direction(Direction::Horizontal)
+      .constraints([Constraint::Fill(1), Constraint::Fill(1)].as_ref())
+      .split(bw_area);
+
+    // 1st column
+    let sys_bw_label = format!(
+      "System {:.2} GB/s ({:.2}, {:.2})",
+      self.sys_total_bw.current / 1e9,
+      self.sys_total_bw.avg / 1e9,
+      self.sys_total_bw.max / 1e9
+    );
+    let sys_bw = self.borderless_title(&sys_bw_label, "");
+    let iarea = sys_bw.inner(bw_area[0]);
+    f.render_widget(sys_bw, bw_area[0]);
+    let (c1, c2) = v_stack(iarea);
+    f.render_widget(self.get_bandwidth_block("Read", &self.sys_rd_bw), c1);
+    f.render_widget(self.get_bandwidth_block("Write", &self.sys_wr_bw), c2);
+
+    // 2nd column
+    let ane_bw_label = format!(
+      "ANE {:.2} GB/s ({:.2}, {:.2})",
+      self.ane_total_bw.current / 1e9,
+      self.ane_total_bw.avg / 1e9,
+      self.ane_total_bw.max / 1e9
+    );
+    let ane_bw = self.borderless_title(&ane_bw_label, "");
+    let iarea = ane_bw.inner(bw_area[1]);
+    f.render_widget(ane_bw, bw_area[1]);
+    let (c1, c2) = v_stack(iarea);
+    f.render_widget(self.get_bandwidth_block("Read", &self.ane_rd_bw), c1);
+    f.render_widget(self.get_bandwidth_block("Write", &self.ane_wr_bw), c2);
+
+    // Power row
     let label_l = format!(
       "Power: {:.2}W (avg {:.2}W, max {:.2}W)",
       self.all_power.top_value, self.all_power.avg_value, self.all_power.max_value,
@@ -364,8 +489,8 @@ impl App {
     let block = self.title_block(&label_l, &label_r);
     let usage = " Press 'q' to quit, 'c' – color, 'v' – view ";
     let block = block.title_bottom(Line::from(usage).right_aligned());
-    let iarea = block.inner(rows[1]);
-    f.render_widget(block, rows[1]);
+    let iarea = block.inner(rows[2]);
+    f.render_widget(block, rows[2]);
 
     let ha = Layout::default()
       .direction(Direction::Horizontal)

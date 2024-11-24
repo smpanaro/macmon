@@ -15,6 +15,10 @@ Sudoless performance monitoring CLI tool for Apple Silicon processors.
   <img src="https://github.com/vladkens/macmon/blob/assets/macmon.png?raw=true" alt="preview" />
 </div>
 
+> [!IMPORTANT]
+> This fork adds _experimental_ support for rendering memory bandwidth. I'm pretty sure I chose the correct metrics, but it's possible I did not.
+(These are no longer exposed through powermetrics so there is no official tool to check against. If you know of one, let me know.)
+
 ## Motivation
 
 Apple Silicon processors don't provide an easy way to see live power consumption. I was interested in this information while testing local LLM models. `asitop` is a nice and simple TUI to quickly see current metrics, but it reads data from `powermetrics` and requires root privileges. `macmon` uses a private macOS API to gather metrics (essentially the same as `powermetrics`) but runs without sudo. 🎉
