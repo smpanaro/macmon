@@ -1,3 +1,4 @@
+use std::iter::zip;
 use std::{io::stdout, time::Instant};
 use std::{sync::mpsc, time::Duration};
 
@@ -8,7 +9,7 @@ use ratatui::crossterm::{
 use ratatui::{prelude::*, widgets::*};
 
 use crate::config::{Config, ViewType};
-use crate::metrics::{zero_div, Metrics, Sampler};
+use crate::metrics::{zero_div, MetricHistogram, Metrics, Sampler};
 use crate::{
   metrics::{MemMetrics, TempMetrics},
   sources::SocInfo,
@@ -226,6 +227,7 @@ pub struct App {
   all_rd_bw: BandwidthStore,
   all_wr_bw: BandwidthStore,
   all_total_bw: BandwidthStore,
+  ane_bw_hist: MetricHistogram,
 }
 
 impl App {
@@ -255,6 +257,7 @@ impl App {
     self.all_rd_bw.push(data.ane_rd_bw + data.sys_rd_bw);
     self.all_wr_bw.push(data.ane_wr_bw + data.sys_wr_bw);
     self.all_total_bw.push(data.ane_rd_bw + data.ane_wr_bw + data.sys_rd_bw + data.sys_wr_bw);
+    self.ane_bw_hist = data.ane_bw_hist;
   }
 
   fn title_block<'a>(&self, label_l: &str, label_r: &str) -> Block<'a> {
@@ -329,6 +332,29 @@ impl App {
       .direction(RenderDirection::RightToLeft)
       .data(val.items.iter().map(|&x| x as u64).collect::<Vec<u64>>())
       .max(val.max as u64)
+      .style(self.cfg.color)
+  }
+
+  fn get_bandwidth_hist_block<'a>(&self, label: &str, val: &'a MetricHistogram) -> BarChart<'a> {
+    let bars: Vec<Bar> = zip(val.labels.iter(), val.values.iter())
+      .enumerate()
+      .map(|(i, (label, value))| {
+        Bar::default()
+          .value(*value)
+          .label(match i % 2 {
+            0 => Line::from(format!("{}", label.trim().replace("GB/s", ""))),
+            _ => Line::default(),
+          })
+          .text_value(String::new())
+          .style(self.cfg.color)
+      })
+      .collect();
+
+    BarChart::default()
+      .block(self.title_block(label, ""))
+      .bar_width(2)
+      .bar_gap(0)
+      .data(BarGroup::default().bars(&bars))
       .style(self.cfg.color)
   }
 
@@ -461,14 +487,19 @@ impl App {
       "ANE {:.2} GB/s ({:.2}, {:.2})",
       self.ane_total_bw.current / 1e9,
       self.ane_total_bw.avg / 1e9,
-      self.ane_total_bw.max / 1e9
+      self.ane_total_bw.max / 1e9,
     );
-    let ane_bw = self.borderless_title(&ane_bw_label, "");
-    let iarea = ane_bw.inner(bw_area[1]);
-    f.render_widget(ane_bw, bw_area[1]);
-    let (c1, c2) = v_stack(iarea);
-    f.render_widget(self.get_bandwidth_block("Read", &self.ane_rd_bw), c1);
-    f.render_widget(self.get_bandwidth_block("Write", &self.ane_wr_bw), c2);
+    if self.cfg.view_type == ViewType::Gauge {
+      // Bars in this case are basically many gauges.
+      f.render_widget(self.get_bandwidth_hist_block(&ane_bw_label, &self.ane_bw_hist), bw_area[1]);
+    } else {
+      let ane_bw = self.borderless_title(&ane_bw_label, "");
+      let iarea = ane_bw.inner(bw_area[1]);
+      f.render_widget(ane_bw, bw_area[1]);
+      let (c1, c2) = v_stack(iarea);
+      f.render_widget(self.get_bandwidth_block("Read", &self.ane_rd_bw), c1);
+      f.render_widget(self.get_bandwidth_block("Write", &self.ane_wr_bw), c2);
+    }
 
     // Power row
     let label_l = format!(

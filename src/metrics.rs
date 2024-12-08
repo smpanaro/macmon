@@ -27,22 +27,48 @@ pub struct MemMetrics {
   pub swap_usage: u64, // bytes
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct MetricHistogram {
+  pub labels: Vec<String>,
+  pub values: Vec<u64>,
+}
+
+// impl MetricHistogram {
+//   pub fn weighted_average_gbps(&self) -> f64 {
+//     let mut sum_products = 0.0;
+//     let sum_weights: u64 = self.values.iter().sum();
+
+//     for (label, &weight) in self.labels.iter().zip(self.values.iter()) {
+//       if let Ok(gbps) = label.trim().replace("GB/s", "").parse::<f64>() {
+//         sum_products += gbps * (weight as f64);
+//       }
+//     }
+
+//     if sum_weights > 0 {
+//       sum_products / (sum_weights as f64)
+//     } else {
+//       0.0
+//     }
+//   }
+// }
+
 #[derive(Debug, Default)]
 pub struct Metrics {
   pub temp: TempMetrics,
   pub memory: MemMetrics,
-  pub ecpu_usage: (u32, f32), // freq, percent_from_max
-  pub pcpu_usage: (u32, f32), // freq, percent_from_max
-  pub gpu_usage: (u32, f32),  // freq, percent_from_max
-  pub cpu_power: f32,         // Watts
-  pub gpu_power: f32,         // Watts
-  pub ane_power: f32,         // Watts
-  pub all_power: f32,         // Watts
-  pub sys_power: f32,         // Watts
-  pub ane_rd_bw: u64,         // ANE read bandwidth in B/s
-  pub ane_wr_bw: u64,         // ANE write bandwidth in B/s
-  pub sys_rd_bw: u64,         // system read bandwidth in B/s (excluding ANE)
-  pub sys_wr_bw: u64,         // system write bandwidth in B/s (excluding ANE)
+  pub ecpu_usage: (u32, f32),       // freq, percent_from_max
+  pub pcpu_usage: (u32, f32),       // freq, percent_from_max
+  pub gpu_usage: (u32, f32),        // freq, percent_from_max
+  pub cpu_power: f32,               // Watts
+  pub gpu_power: f32,               // Watts
+  pub ane_power: f32,               // Watts
+  pub all_power: f32,               // Watts
+  pub sys_power: f32,               // Watts
+  pub ane_rd_bw: u64,               // ANE read bandwidth in B/s
+  pub ane_wr_bw: u64,               // ANE write bandwidth in B/s
+  pub sys_rd_bw: u64,               // system read bandwidth in B/s (excluding ANE)
+  pub sys_wr_bw: u64,               // system write bandwidth in B/s (excluding ANE)
+  pub ane_bw_hist: MetricHistogram, // GB/s distribution of ANE read+write BW
 }
 
 // MARK: Helpers
@@ -84,6 +110,29 @@ fn calc_freq_final(items: &Vec<(u32, f32)>, freqs: &Vec<u32>) -> (u32, f32) {
   let min_freq = freqs.first().unwrap().clone() as f32;
 
   (avg_freq.max(min_freq) as u32, avg_perc)
+}
+
+fn sum_hist(a: &MetricHistogram, b: &MetricHistogram) -> MetricHistogram {
+  let mut labels = a.labels.clone();
+  let mut values = a.values.clone();
+
+  for i in 0..b.values.len() {
+    let idx = labels.iter().position(|x| x == &b.labels[i]);
+    match idx {
+      Some(idx) => values[idx] += b.values[i],
+      None => {
+        labels.push(b.labels[i].clone());
+        values.push(b.values[i]);
+      }
+    }
+  }
+
+  MetricHistogram { labels, values }
+}
+
+fn zero_div_hist(a: &MetricHistogram, b: u64) -> MetricHistogram {
+  let values = a.values.iter().map(|x| zero_div(*x, b)).collect();
+  MetricHistogram { labels: a.labels.clone(), values }
 }
 
 fn init_smc() -> WithError<(SMC, Vec<String>, Vec<String>)> {
@@ -141,6 +190,7 @@ impl Sampler {
       ("CPU Stats", Some(CPU_FREQ_CORE_SUBG)), // cpu freq per core
       ("GPU Stats", Some(GPU_FREQ_DICE_SUBG)), // gpu freq
       ("AMC Stats", Some("Perf Counters")),    // mem bw
+      ("PMP", Some("AF BW")),                  // "Apple Fabric" (?) mem bw histogram
     ];
 
     let soc = SocInfo::new()?;
@@ -284,6 +334,28 @@ impl Sampler {
             _ => {}
           }
         }
+
+        if x.group == "PMP" && x.subgroup == "AF BW" {
+          match x.channel.as_str() {
+            s if s.starts_with("ANE") && s.ends_with("RD+WR") => {
+              let events = cfio_get_residencies(x.item);
+              if rs.ane_bw_hist.values.len() == 0 {
+                rs.ane_bw_hist.labels = events.iter().map(|x| x.0.clone()).collect();
+                rs.ane_bw_hist.values = vec![0; events.len()];
+              }
+              assert!(
+                rs.ane_bw_hist.values.len() == events.len(),
+                "ANE BW length mismatch: {} != {}",
+                rs.ane_bw_hist.values.len(),
+                events.len()
+              );
+              for i in 0..events.len() {
+                rs.ane_bw_hist.values[i] += events[i].1 as u64;
+              }
+            }
+            _ => {}
+          }
+        }
       }
 
       rs.ecpu_usage = calc_freq_final(&ecpu_usages, &self.soc.ecpu_freqs);
@@ -316,6 +388,14 @@ impl Sampler {
     rs.sys_wr_bw = zero_div(results.iter().map(|x| x.sys_wr_bw).sum(), measures as _); // bytes/sec
     rs.ane_rd_bw = zero_div(results.iter().map(|x| x.ane_rd_bw).sum(), measures as _); // bytes/sec
     rs.ane_wr_bw = zero_div(results.iter().map(|x| x.ane_wr_bw).sum(), measures as _); // bytes/sec
+
+    rs.ane_bw_hist = results
+      .iter()
+      .map(|x| x.ane_bw_hist.clone())
+      .reduce(|a, b| sum_hist(&a, &b))
+      .map(|hist| zero_div_hist(&hist, measures as _))
+      .unwrap_or_default();
+    // println!("{:?}", rs.ane_bw_hist);
 
     rs.memory = self.get_mem()?;
     rs.temp = self.get_temp()?;
