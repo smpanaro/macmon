@@ -227,7 +227,7 @@ pub struct App {
   all_rd_bw: BandwidthStore,
   all_wr_bw: BandwidthStore,
   all_total_bw: BandwidthStore,
-  ane_bw_hist: MetricHistogram,
+  ane_bw_rd_hist: MetricHistogram,
 }
 
 impl App {
@@ -257,7 +257,7 @@ impl App {
     self.all_rd_bw.push(data.ane_rd_bw + data.sys_rd_bw);
     self.all_wr_bw.push(data.ane_wr_bw + data.sys_wr_bw);
     self.all_total_bw.push(data.ane_rd_bw + data.ane_wr_bw + data.sys_rd_bw + data.sys_wr_bw);
-    self.ane_bw_hist = data.ane_bw_hist;
+    self.ane_bw_rd_hist = data.ane_bw_rd_hist;
   }
 
   fn title_block<'a>(&self, label_l: &str, label_r: &str) -> Block<'a> {
@@ -491,7 +491,7 @@ impl App {
     );
     if self.cfg.view_type == ViewType::Gauge {
       // Bars in this case are basically many gauges.
-      f.render_widget(self.get_bandwidth_hist_block(&ane_bw_label, &self.ane_bw_hist), bw_area[1]);
+      f.render_widget(self.get_bandwidth_hist_block(&ane_bw_label, &self.ane_bw_rd_hist), bw_area[1]);
     } else {
       let ane_bw = self.borderless_title(&ane_bw_label, "");
       let iarea = ane_bw.inner(bw_area[1]);
