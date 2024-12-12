@@ -15,6 +15,9 @@ Sudoless performance monitoring CLI tool for Apple Silicon processors.
   <img src="https://github.com/vladkens/macmon/blob/assets/macmon.png?raw=true" alt="preview" />
 </div>
 
+Experimental fork for M4 Macs (macOS 15.2 Sequia) using Histogram Bins for memory bandwidth.
+Original fork: https://github.com/smpanaro/macmon
+
 > [!IMPORTANT]
 > This fork adds _experimental_ support for rendering memory bandwidth. I'm pretty sure I chose the correct metrics, but it's possible I did not.
 (These are no longer exposed through powermetrics so there is no official tool to check against. If you know of one, let me know.)

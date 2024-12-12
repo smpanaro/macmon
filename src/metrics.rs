@@ -1,4 +1,7 @@
 use core_foundation::dictionary::CFDictionaryRef;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sources::{
   cfio_bytes, cfio_get_residencies, cfio_watts, libc_ram, libc_swap, IOHIDSensors, IOReport,
@@ -33,24 +36,33 @@ pub struct MetricHistogram {
   pub values: Vec<u64>,
 }
 
-// impl MetricHistogram {
-//   pub fn weighted_average_gbps(&self) -> f64 {
-//     let mut sum_products = 0.0;
-//     let sum_weights: u64 = self.values.iter().sum();
+impl MetricHistogram {
+  pub fn weighted_average_gbps(&self, label: &str) -> f64 {
+    log_to_file(&format!("\nCalculating weighted average bandwidth for {}:", label));
+     let mut sum_products = 0.0;
+    let sum_weights: u64 = self.values.iter().sum();
 
-//     for (label, &weight) in self.labels.iter().zip(self.values.iter()) {
-//       if let Ok(gbps) = label.trim().replace("GB/s", "").parse::<f64>() {
-//         sum_products += gbps * (weight as f64);
-//       }
-//     }
+    log_to_file(&format!("Total weights (samples): {}", sum_weights));
 
-//     if sum_weights > 0 {
-//       sum_products / (sum_weights as f64)
-//     } else {
-//       0.0
-//     }
-//   }
-// }
+    for (label, &weight) in self.labels.iter().zip(self.values.iter()) {
+      if let Ok(gbps) = label.trim().replace("GB/s", "").trim().parse::<f64>() {
+        let contribution = gbps * (weight as f64);
+        log_to_file(&format!("Band {} GB/s: {} samples, contribution: {}", 
+          gbps, weight, contribution));
+        sum_products += contribution;
+      }
+    }
+
+    let avg = if sum_weights > 0 {
+      sum_products / (sum_weights as f64)
+    } else {
+      0.0
+    };
+
+    log_to_file(&format!("Weighted average: {} GB/s", avg));
+    avg
+  }
+}
 
 #[derive(Debug, Default)]
 pub struct Metrics {
@@ -68,7 +80,17 @@ pub struct Metrics {
   pub ane_wr_bw: u64,               // ANE write bandwidth in B/s
   pub sys_rd_bw: u64,               // system read bandwidth in B/s (excluding ANE)
   pub sys_wr_bw: u64,               // system write bandwidth in B/s (excluding ANE)
-  pub ane_bw_hist: MetricHistogram, // GB/s distribution of ANE read+write BW
+//  pub ane_bw_rd_hist: MetricHistogram, // GB/s distribution of ANE read+write BW
+  pub ane_bw_rd_hist: MetricHistogram, // GB/s distribution of ANE read BW
+  pub ane_bw_wr_hist: MetricHistogram, // GB/s distribution of ANE read BW
+
+
+  pub sys_rd_bw_hist: MetricHistogram, // GB/s distribution of system read BW
+  pub sys_rw_bw_hist: MetricHistogram, // GB/s distribution of system read+write BW
+  pub floor_rd_bw_hist: MetricHistogram, // GB/s distribution of system 
+  pub floor_rw_bw_hist: MetricHistogram, // GB/s distribution of system 
+
+
 }
 
 // MARK: Helpers
@@ -113,21 +135,26 @@ fn calc_freq_final(items: &Vec<(u32, f32)>, freqs: &Vec<u32>) -> (u32, f32) {
 }
 
 fn sum_hist(a: &MetricHistogram, b: &MetricHistogram) -> MetricHistogram {
-  let mut labels = a.labels.clone();
-  let mut values = a.values.clone();
+  log_to_file("\nSumming histograms:");
+  log_to_file(&format!("Histogram A labels: {:?}", a.labels));
+  log_to_file(&format!("Histogram A values: {:?}", a.values));
+  log_to_file(&format!("Histogram B labels: {:?}", b.labels));
+  log_to_file(&format!("Histogram B values: {:?}", b.values));
 
-  for i in 0..b.values.len() {
-    let idx = labels.iter().position(|x| x == &b.labels[i]);
-    match idx {
-      Some(idx) => values[idx] += b.values[i],
-      None => {
-        labels.push(b.labels[i].clone());
-        values.push(b.values[i]);
-      }
-    }
+  assert!(a.labels == b.labels, "Histogram labels mismatch");
+  let mut rs = MetricHistogram {
+    labels: a.labels.clone(),
+    values: vec![0; a.values.len()],
+  };
+
+  for i in 0..a.values.len() {
+    rs.values[i] = a.values[i] + b.values[i];
   }
 
-  MetricHistogram { labels, values }
+  log_to_file(&format!("Result histogram labels: {:?}", rs.labels));
+  log_to_file(&format!("Result histogram values: {:?}", rs.values));
+
+  rs
 }
 
 fn zero_div_hist(a: &MetricHistogram, b: u64) -> MetricHistogram {
@@ -191,6 +218,9 @@ impl Sampler {
       ("GPU Stats", Some(GPU_FREQ_DICE_SUBG)), // gpu freq
       ("AMC Stats", Some("Perf Counters")),    // mem bw
       ("PMP", Some("AF BW")),                  // "Apple Fabric" (?) mem bw histogram
+      ("PMP", Some("DCS BW")),                  // "Apple Fabric" (?) mem bw histogram
+      ("PMP", Some("AFR BW")),                  // "Apple Fabric" (?) mem bw histogram
+      ("PMP", Some("AFI BW")),                  // "Apple Fabric" (?) mem bw histogram
     ];
 
     let soc = SocInfo::new()?;
@@ -310,6 +340,8 @@ impl Sampler {
         }
 
         if x.group == "AMC Stats" && x.subgroup == "Perf Counters" {
+          log_to_file(&format!("Found AMC Stats channel: {}", x.channel));
+          
           match x.channel.as_str() {
             // There are two values for ANE: "ANE0 DCS RD" and "ANE0 RD".
             // Per asitop, DCS = DRAM Command Scheduler. When asitop
@@ -317,45 +349,34 @@ impl Sampler {
             // The DCS value also seems closer to the number I expect for a test
             // ANE model based on the size of the weights and the tokens/second.
             // The non-DCS value is slightly higher.
+
             s if s.starts_with("ANE") && s.ends_with("DCS RD") => {
-              rs.ane_rd_bw += cfio_bytes(x.item); // bytes
+              let bytes = cfio_bytes(x.item);
+              log_to_file(&format!("ANE DCS RD bytes: {}", bytes));
+              rs.ane_rd_bw += bytes;
             }
             s if s.starts_with("ANE") && s.ends_with("DCS WR") => {
-              rs.ane_wr_bw += cfio_bytes(x.item); // bytes
+              let bytes = cfio_bytes(x.item);
+              log_to_file(&format!("ANE DCS WR bytes: {}", bytes));
+              rs.ane_wr_bw += bytes;
             }
-            // There doesn't seem to be a non-DCS overall metric.
-            // NOTE: This includes the ANE value, which is subtracted out below.
             "DCS RD" => {
-              rs.sys_rd_bw += cfio_bytes(x.item); // bytes
+              let bytes = cfio_bytes(x.item);
+              log_to_file(&format!("System DCS RD bytes: {}", bytes));
+              rs.sys_rd_bw += bytes;
             }
             "DCS WR" => {
-              rs.sys_wr_bw += cfio_bytes(x.item); // bytes
+              let bytes = cfio_bytes(x.item);
+              log_to_file(&format!("System DCS WR bytes: {}", bytes));
+              rs.sys_wr_bw += bytes;
             }
-            _ => {}
+            _ => {
+              log_to_file(&format!("Unhandled AMC Stats channel: {}", x.channel));
+            }
           }
         }
 
-        if x.group == "PMP" && x.subgroup == "AF BW" {
-          match x.channel.as_str() {
-            s if s.starts_with("ANE") && s.ends_with("RD+WR") => {
-              let events = cfio_get_residencies(x.item);
-              if rs.ane_bw_hist.values.len() == 0 {
-                rs.ane_bw_hist.labels = events.iter().map(|x| x.0.clone()).collect();
-                rs.ane_bw_hist.values = vec![0; events.len()];
-              }
-              assert!(
-                rs.ane_bw_hist.values.len() == events.len(),
-                "ANE BW length mismatch: {} != {}",
-                rs.ane_bw_hist.values.len(),
-                events.len()
-              );
-              for i in 0..events.len() {
-                rs.ane_bw_hist.values[i] += events[i].1 as u64;
-              }
-            }
-            _ => {}
-          }
-        }
+        process_bandwidth_histograms(&x.group, &x.subgroup, &x.channel, x.item, &mut rs);
       }
 
       rs.ecpu_usage = calc_freq_final(&ecpu_usages, &self.soc.ecpu_freqs);
@@ -389,13 +410,61 @@ impl Sampler {
     rs.ane_rd_bw = zero_div(results.iter().map(|x| x.ane_rd_bw).sum(), measures as _); // bytes/sec
     rs.ane_wr_bw = zero_div(results.iter().map(|x| x.ane_wr_bw).sum(), measures as _); // bytes/sec
 
-    rs.ane_bw_hist = results
-      .iter()
-      .map(|x| x.ane_bw_hist.clone())
-      .reduce(|a, b| sum_hist(&a, &b))
-      .map(|hist| zero_div_hist(&hist, measures as _))
-      .unwrap_or_default();
-    // println!("{:?}", rs.ane_bw_hist);
+    let (
+        ane_bw_rd_hist, 
+        ane_bw_wr_hist,
+        sys_rd_bw_hist, 
+        sys_rw_bw_hist, 
+        floor_rd_bw_hist, 
+        floor_rw_bw_hist
+    ) = consolidate_histograms(&results, measures);
+
+    rs.ane_bw_rd_hist = ane_bw_rd_hist;
+    rs.ane_bw_wr_hist = ane_bw_wr_hist;
+    rs.sys_rd_bw_hist = sys_rd_bw_hist;
+    rs.sys_rw_bw_hist = sys_rw_bw_hist;
+    rs.floor_rd_bw_hist = floor_rd_bw_hist;
+    rs.floor_rw_bw_hist = floor_rw_bw_hist;
+
+    // Calculate and log the average bandwidth
+    let ane_avg_rd_bw = rs.ane_bw_rd_hist.weighted_average_gbps("ane_avg_rd_bw");
+    let ane_avg_wr_bw = rs.ane_bw_wr_hist.weighted_average_gbps("ane_avg_wr_bw");
+    let sys_rd_bw = rs.sys_rd_bw_hist.weighted_average_gbps("sys_rd_bw");
+    let sys_rw_bw = rs.sys_rw_bw_hist.weighted_average_gbps("sys_rw_bw");
+    let floor_rd_avg_bw = rs.floor_rd_bw_hist.weighted_average_gbps("floor_rd_avg_bw");
+    let floor_rw_avg_bw = rs.floor_rw_bw_hist.weighted_average_gbps("floor_rw_avg_bw");
+    //if rs.ane_rd_bw == 0 {
+    //  rs.ane_rd_bw = (avg_bw * 1024.0 * 1024.0 * 1024.0) as u64; // Convert GB/s to B/s
+    //}
+
+    let freq_adj = 1.0 ; // scale- experimental
+    
+    // Use Bandwidth Histograms if failed to get values from AMC Stats
+    // this is required for M4 Macs (Sequia)
+    
+    if rs.ane_rd_bw==0 {
+       rs.ane_rd_bw = (ane_avg_rd_bw * 1024.0 * 1024.0 * 1024.0) as u64; // Convert GB/s to B/s
+    }
+    
+    if rs.ane_wr_bw==0 {
+      rs.ane_wr_bw = ((ane_avg_wr_bw - ane_avg_rd_bw) * 1024.0 * 1024.0 * 1024.0) as u64; // Convert GB/s to B/s
+    }
+    
+    if rs.sys_rd_bw==0 {
+      rs.sys_rd_bw = ((sys_rd_bw - floor_rd_avg_bw) * 1024.0 * 1024.0 * 1024.0 * freq_adj ) as u64; // Convert GB/s to B/s
+    }
+    
+    if rs.sys_wr_bw==0 {
+      rs.sys_wr_bw = (
+        ((sys_rw_bw - floor_rw_avg_bw)-(sys_rd_bw - floor_rd_avg_bw))
+        * 1024.0 * 1024.0 * 1024.0 * freq_adj 
+      ) as u64; // Convert GB/s to B/s
+    }
+
+    rs.sys_wr_bw = rs.sys_wr_bw * freq_adj as u64;
+    
+    log_to_file(&format!("Average ANE bandwidth: {} GB/s", ane_avg_rd_bw));
+    log_to_file(&format!("Average System bandwidth: {} GB/s", sys_rd_bw));
 
     rs.memory = self.get_mem()?;
     rs.temp = self.get_temp()?;
@@ -405,6 +474,128 @@ impl Sampler {
       Err(_) => 0.0,
     };
 
+    log_to_file(&format!("Final bandwidth values:"));
+    log_to_file(&format!("ANE read: {} B/s", rs.ane_rd_bw));
+    log_to_file(&format!("ANE write: {} B/s", rs.ane_wr_bw));
+    log_to_file(&format!("System read: {} B/s", rs.sys_rd_bw));
+    log_to_file(&format!("System write: {} B/s", rs.sys_wr_bw));
+
     Ok(rs)
+  }
+}
+
+fn update_histogram(
+    hist: &mut MetricHistogram,
+    events: Vec<(String, u64)>,
+    channel_name: &str,
+) {
+    log_to_file(&format!("Found AMCC Stats channel: {}", channel_name));
+    if hist.values.len() == 0 {
+        hist.labels = events.iter().map(|x| x.0.clone()).collect();
+        hist.values = vec![0; events.len()];
+    }
+    assert!(
+        hist.values.len() == events.len(),
+        "AMCC BW length mismatch: {} != {}",
+        hist.values.len(),
+        events.len()
+    );
+    for i in 0..events.len() {
+        hist.values[i] += events[i].1 as u64;
+    }
+}
+
+fn process_bandwidth_histograms(
+    group: &str,
+    subgroup: &str,
+    channel: &str,
+    item: CFDictionaryRef,
+    rs: &mut Metrics,
+) {
+    if group != "PMP" {
+        return;
+    }
+
+    let events = cfio_get_residencies(item);
+    let events: Vec<(String, u64)> = events
+        .into_iter()
+        .map(|(s, v)| (s, v.max(0) as u64))
+        .collect();
+
+    match (subgroup, channel) {
+        ("DCS BW", s) if s.starts_with("AMCC") && s.ends_with("RD") => {
+            update_histogram(&mut rs.sys_rd_bw_hist, events, channel);
+        }
+        ("DCS BW", s) if s.starts_with("AMCC") && s.ends_with("RD+WR") => {
+            update_histogram(&mut rs.sys_rw_bw_hist, events, channel);
+        }
+        ("AFR BW", s) if s.starts_with("AMCC") && s.ends_with("RD") => {
+            update_histogram(&mut rs.floor_rd_bw_hist, events, channel);
+        }
+        ("AFR BW", s) if s.starts_with("AMCC") && s.ends_with("RD+WR") => {
+            update_histogram(&mut rs.floor_rw_bw_hist, events, channel);
+        }
+        ("AF BW", s) if s.starts_with("ANE") && s.ends_with("RD") => {
+            update_histogram(&mut rs.ane_bw_rd_hist, events, channel);
+        }
+        ("AF BW", s) if s.starts_with("ANE") && s.ends_with("RD+WR") => {
+          update_histogram(&mut rs.ane_bw_wr_hist, events, channel);
+      }
+        _ => {}
+    }
+}
+
+fn consolidate_histograms(results: &Vec<Metrics>, measures: usize) -> (
+  MetricHistogram, 
+  MetricHistogram, 
+  MetricHistogram, 
+  MetricHistogram, 
+  MetricHistogram, 
+  MetricHistogram
+) {
+    let process_histogram = |selector: fn(&Metrics) -> MetricHistogram| {
+        results
+            .iter()
+            .map(|x| selector(x))
+            .reduce(|a, b| sum_hist(&a, &b))
+            .map(|hist| zero_div_hist(&hist, measures as _))
+            .unwrap_or_default()
+    };
+
+    (
+      
+        process_histogram(|x| x.ane_bw_rd_hist.clone()),
+        process_histogram(|x| x.ane_bw_wr_hist.clone()),
+        process_histogram(|x| x.sys_rd_bw_hist.clone()),
+        process_histogram(|x| x.sys_rw_bw_hist.clone()),
+        process_histogram(|x| x.floor_rd_bw_hist.clone()),
+        process_histogram(|x| x.floor_rw_bw_hist.clone()),
+    )
+}
+
+
+fn log_to_file(message: &str) {
+  if false {  // disable logging
+    let log_path = "macmon_debug.log";
+    match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path) 
+    {
+        
+        Ok(mut file) => {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            
+            if let Err(e) = writeln!(file, "[{}] {}", timestamp, message) {
+                eprintln!("Failed to write to log file {}: {}", log_path, e);
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to open log file {}: {}", log_path, e);
+        }
+    }
   }
 }
